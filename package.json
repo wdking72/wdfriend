@@ -6,7 +6,7 @@
   "description": "有记忆的 AI 朋友",
   "scripts": {
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:front\"",
-    "dev:api": "vercel dev --listen 3001",
+    "dev:api": "tsx watch api/dev-server.ts",
     "dev:front": "cd frontend && npm run dev",
     "build": "cd frontend && npm run build",
     "typecheck": "tsc --noEmit",
@@ -18,8 +18,9 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@vercel/node": "^5.0.0",
     "concurrently": "^9.0.0",
-    "typescript": "^5.5.0",
-    "vercel": "^37.0.0"
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
   }
 }
