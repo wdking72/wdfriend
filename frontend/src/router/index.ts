@@ -13,6 +13,11 @@ const router = createRouter({
       name: "chat-room",
       component: () => import("../views/ChatRoom.vue"),
     },
+    {
+      path: "/memories",
+      name: "memories",
+      component: () => import("../views/Memories.vue"),
+    },
   ],
 });
 

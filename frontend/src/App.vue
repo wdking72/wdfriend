@@ -1,7 +1,14 @@
 <script setup lang="ts">
+import { computed } from "vue";
+import { useRoute } from "vue-router";
 import { useAuth } from "./composables/useAuth.js";
+import BottomNav from "./components/BottomNav.vue";
 
 const { userId, isLoading } = useAuth();
+const route = useRoute();
+
+// 聊天室页面隐藏底部导航
+const showNav = computed(() => route.name !== "chat-room");
 </script>
 
 <template>
@@ -12,6 +19,11 @@ const { userId, isLoading } = useAuth();
     </div>
 
     <!-- 主内容 -->
-    <router-view v-else :user-id="userId" />
+    <template v-else>
+      <div class="flex-1 overflow-hidden">
+        <router-view :user-id="userId" />
+      </div>
+      <BottomNav v-if="showNav" />
+    </template>
   </div>
 </template>

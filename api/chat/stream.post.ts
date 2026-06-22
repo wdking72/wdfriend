@@ -3,16 +3,21 @@ import { createServerClient } from "../../src/lib/supabase.js";
 import { createLLM } from "../../src/llm/index.js";
 import { NativeToolAgent } from "../../src/core/agent-native.js";
 import { MemoryManager } from "../../src/core/memory.js";
-import type { StreamChunk } from "../../src/types/index.js";
+import { MemoryExtractor } from "../../src/core/memory-extractor.js";
+import { buildSystemPrompt } from "../../src/core/prompt-builder.js";
+import type { StreamChunk, Memory } from "../../src/types/index.js";
 
 /**
  * POST /api/chat/stream
  * 流式聊天接口（SSE）
+ * 集成记忆系统：对话时注入记忆，对话后提取新记忆
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {
-    return res.status(405).json({ error: { code: "METHOD_NOT_ALLOWED", message: "只支持 POST" } });
+    return res.status(405).json({ error: { code: "METHOD_NOT_ALLOWED", message: "只支持 GET" } });
   }
+
+  let supabase: ReturnType<typeof createServerClient> | null = null;
 
   try {
     const userId = req.headers["x-user-id"] as string;
@@ -33,7 +38,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: { code: "INVALID_INPUT", message: "缺少对话 ID" } });
     }
 
-    const supabase = createServerClient();
+    supabase = createServerClient();
 
     // 验证对话属于该用户
     const { data: conversation, error: convError } = await supabase
@@ -55,49 +60,50 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     res.setHeader("Content-Encoding", "identity");
     res.status(200);
 
-    // 加载历史消息用于上下文
-    const { data: history } = await supabase
-      .from("messages")
-      .select("role, content")
-      .eq("conversation_id", conversationId)
-      .order("created_at", { ascending: true })
-      .limit(50); // 限制历史长度
+    const sendSSE = (event: string, data: unknown) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
 
-    // 构建记忆管理器
+    // 并行加载历史消息和用户记忆
+    const [historyResult, memoriesResult] = await Promise.all([
+      supabase
+        .from("messages")
+        .select("role, content")
+        .eq("conversation_id", conversationId)
+        .order("created_at", { ascending: true })
+        .limit(50),
+      supabase
+        .from("memories")
+        .select("*")
+        .eq("user_id", userId)
+        .order("importance", { ascending: false })
+        .limit(50),
+    ]);
+
+    const history = historyResult.data ?? [];
+    const memories = (memoriesResult.data ?? []) as Memory[];
+
+    // 构建记忆管理器（加载历史消息上下文）
     const memory = new MemoryManager({ strategy: "sliding-window", maxTurns: 15 });
-    if (history) {
-      for (const msg of history) {
-        if (msg.role === "user" || msg.role === "assistant") {
-          memory.addMessage({ role: msg.role, content: msg.content });
-        }
+    for (const msg of history) {
+      if (msg.role === "user" || msg.role === "assistant") {
+        memory.addMessage({ role: msg.role, content: msg.content });
       }
     }
 
-    // 创建 LLM 和 Agent
-    const llm = createLLM({
+    // 创建 LLM
+    const llmConfig = {
       baseURL: process.env.API_BASE_URL!,
       model: process.env.MODEL!,
       apiKey: process.env.API_KEY!,
-    });
+    };
+    const llm = createLLM(llmConfig);
 
-    const agent = new NativeToolAgent({
-      baseURL: process.env.API_BASE_URL!,
-      model: process.env.MODEL!,
-      apiKey: process.env.API_KEY!,
-      memory,
-    });
+    // 构建包含记忆的系统提示词
+    const systemPrompt = buildSystemPrompt(memories);
 
-    // 系统提示词
-    const systemPrompt = `你是用户的一个好朋友。你的性格温暖、真诚、有趣。
-你不只是一个 AI 助手，你是用户信任的朋友。
-
-对话风格：
-- 像朋友一样自然，不要用"您好"、"请问"等客服用语
-- 可以用 emoji、口语化表达
-- 如果用户分享情绪，先共情再回应
-- 不要每次都长篇大论，有时候简短的回复更自然
-- 记住你们之前聊过的内容，像老朋友一样`;
-
+    // 创建 Agent
+    const agent = new NativeToolAgent({ ...llmConfig, memory });
     agent.init(systemPrompt);
 
     // 保存用户消息到数据库
@@ -109,10 +115,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // 流式回复
     let fullResponse = "";
-
-    const sendSSE = (event: string, data: unknown) => {
-      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-    };
 
     await agent.streamChat(message, (chunk: StreamChunk) => {
       if (chunk.type === "text") {
@@ -138,9 +140,79 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     res.end();
+
+    // 异步提取记忆（不阻塞响应）
+    if (fullResponse) {
+      extractMemoriesAsync(userId, [
+        { role: "user", content: message },
+        { role: "assistant", content: fullResponse },
+      ]).catch((err) => console.error("异步记忆提取失败:", err));
+    }
   } catch (err) {
-    const message = err instanceof Error ? err.message : "未知错误";
-    res.write(`event: error\ndata: ${JSON.stringify({ type: "error", content: message })}\n\n`);
+    const errMsg = err instanceof Error ? err.message : "未知错误";
+    res.write(`event: error\ndata: ${JSON.stringify({ type: "error", content: errMsg })}\n\n`);
     res.end();
+  }
+}
+
+/**
+ * 异步提取记忆（不阻塞主响应）
+ */
+async function extractMemoriesAsync(
+  userId: string,
+  messages: Array<{ role: string; content: string }>
+) {
+  try {
+    const supabase = createServerClient();
+    const llmConfig = {
+      baseURL: process.env.API_BASE_URL!,
+      model: process.env.MODEL!,
+      apiKey: process.env.API_KEY!,
+    };
+    const llm = createLLM(llmConfig);
+    const extractor = new MemoryExtractor(llm);
+
+    // 提取新记忆
+    const extracted = await extractor.extract(messages);
+    if (extracted.length === 0) return;
+
+    // 加载已有记忆用于去重
+    const { data: existingMemories } = await supabase
+      .from("memories")
+      .select("id, category, content")
+      .eq("user_id", userId)
+      .limit(100);
+
+    for (const newMemory of extracted) {
+      // 去重检查
+      const dedupResult = await extractor.deduplicate(
+        newMemory,
+        existingMemories ?? []
+      );
+
+      if (dedupResult.action === "skip") {
+        continue;
+      }
+
+      if (dedupResult.action === "update" && dedupResult.targetId) {
+        // 更新已有记忆
+        await supabase
+          .from("memories")
+          .update({ content: dedupResult.merged ?? newMemory.content })
+          .eq("id", dedupResult.targetId);
+      } else {
+        // 添加新记忆
+        await supabase.from("memories").insert({
+          user_id: userId,
+          category: newMemory.category,
+          content: newMemory.content,
+          importance: newMemory.importance,
+        });
+      }
+    }
+
+    console.log(`为用户 ${userId} 提取了 ${extracted.length} 条记忆`);
+  } catch (err) {
+    console.error("记忆提取错误:", err);
   }
 }

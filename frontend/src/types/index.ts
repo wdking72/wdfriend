@@ -22,3 +22,26 @@ export interface StreamChunk {
   content: string;
   truncated?: boolean;
 }
+
+export type MemoryCategory =
+  | "personal"
+  | "preference"
+  | "experience"
+  | "relationship"
+  | "opinion"
+  | "emotion"
+  | "habit"
+  | "goal"
+  | "general";
+
+export interface Memory {
+  id: string;
+  user_id: string;
+  category: MemoryCategory;
+  content: string;
+  source_message_ids: string[];
+  importance: number;
+  last_used_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
